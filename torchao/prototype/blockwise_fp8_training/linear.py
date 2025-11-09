@@ -6,6 +6,12 @@
 
 import torch
 from torch import nn
+from torch.distributed._tensor import DTensor
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    RowwiseParallel,
+)
 
 from torchao.core.config import AOBaseConfig
 from torchao.prototype.blockwise_fp8_training.kernels import (
@@ -203,3 +209,93 @@ class Float8BlockwiseLinearConfig(AOBaseConfig):
 @register_quantize_module_handler(Float8BlockwiseLinearConfig)
 def _float8_blockwise_transform(module, config):
     return Float8BlockwiseLinear.from_float(module)
+
+
+class Float8BlockwiseColwiseParallel(ColwiseParallel):
+    """
+    Tensor parallel ColwiseParallel for Float8BlockwiseLinear.
+
+    Unlike Float8ColwiseParallel, this doesn't handle FP8 casting in the
+    input/output preparation functions since Float8BlockwiseLinear performs
+    FP8 casting internally within its forward/backward passes.
+    """
+
+    @staticmethod
+    def _prepare_input_fn(
+        input_layouts, desired_input_layouts, mod, inputs, device_mesh
+    ):
+        # annotate module input placements/sharding with input_layouts
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, DTensor):
+            input_tensor = DTensor.from_local(
+                input_tensor, device_mesh, input_layouts, run_check=False
+            )
+
+        # transform the input layouts to the desired layouts of ColwiseParallel
+        if input_layouts != desired_input_layouts:
+            input_tensor = input_tensor.redistribute(
+                placements=desired_input_layouts, async_op=True
+            )
+        return input_tensor
+
+    @staticmethod
+    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
+        # outputs is a shard on last dimension DTensor, i.e. Shard(-1)
+        if outputs.placements != output_layouts:
+            outputs = outputs.redistribute(placements=output_layouts, async_op=True)
+
+        # back to local tensor
+        return outputs.to_local() if use_local_output else outputs
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        if not isinstance(module, Float8BlockwiseLinear):
+            raise ValueError(
+                f"Expecting module to be Float8BlockwiseLinear but found {type(module)}"
+            )
+
+        return super()._apply(module, device_mesh)
+
+
+class Float8BlockwiseRowwiseParallel(RowwiseParallel):
+    """
+    Tensor parallel RowwiseParallel for Float8BlockwiseLinear.
+
+    Unlike Float8RowwiseParallel, this doesn't handle FP8 casting in the
+    input/output preparation functions since Float8BlockwiseLinear performs
+    FP8 casting internally within its forward/backward passes.
+    """
+
+    @staticmethod
+    def _prepare_input_fn(
+        input_layouts, desired_input_layouts, mod, inputs, device_mesh
+    ):
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, DTensor):
+            input_tensor = DTensor.from_local(
+                input_tensor, device_mesh, input_layouts, run_check=False
+            )
+
+        if input_layouts != desired_input_layouts:
+            input_tensor = input_tensor.redistribute(
+                placements=desired_input_layouts, async_op=True
+            )
+        return input_tensor
+
+    @staticmethod
+    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
+        # Rowwise sharding produces partial output, depending on output layouts:
+        # 1. to replicate -> allreduce
+        # 2. to shard -> reduce_scatter
+        if outputs.placements != output_layouts:
+            outputs = outputs.redistribute(placements=output_layouts, async_op=True)
+
+        # back to local tensor if use_local_output is True
+        return outputs.to_local() if use_local_output else outputs
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        if not isinstance(module, Float8BlockwiseLinear):
+            raise ValueError(
+                f"Expecting module to be Float8BlockwiseLinear but found {type(module)}"
+            )
+
+        return super()._apply(module, device_mesh)
