@@ -5,7 +5,15 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+import torch.distributed
 from torch import nn
+from torch.distributed._tensor import DTensor, Shard
+from torch.distributed._tensor.placement_types import Partial
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    RowwiseParallel,
+)
 
 from torchao.core.config import AOBaseConfig
 from torchao.prototype.blockwise_fp8_training.kernels import (
@@ -27,6 +35,24 @@ class fp8_blockwise_mm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, block_size, out_dtype=torch.bfloat16, use_triton=False):
         assert block_size == 128, "Only support block_size=128"
+
+        # Handle DTensor inputs - extract local tensors for triton kernels.
+        # When weight is a DTensor (e.g. after parallelize_module for TP), we extract
+        # the local tensor shard and record the DTensor metadata for backward.
+        x_is_dtensor = isinstance(x, DTensor)
+        weight_is_dtensor = isinstance(weight, DTensor)
+        ctx.x_is_dtensor = x_is_dtensor
+        ctx.weight_is_dtensor = weight_is_dtensor
+
+        if x_is_dtensor:
+            ctx.x_device_mesh = x.device_mesh
+            ctx.x_placements = x.placements
+            x = x.to_local()
+
+        if weight_is_dtensor:
+            ctx.weight_device_mesh = weight.device_mesh
+            ctx.weight_placements = weight.placements
+            weight = weight.to_local()
 
         # Temporarily reshape x to 2D tensor
         x_orig_shape = x.shape
@@ -55,6 +81,23 @@ class fp8_blockwise_mm(torch.autograd.Function):
         ctx.block_size = block_size
         ctx.out_dtype = out_dtype
         ctx.use_triton = use_triton
+
+        # When weight is a DTensor, wrap the local output as a DTensor so that
+        # _prepare_output_fn can redistribute it correctly.
+        #   - ColwiseParallel (weight Shard(0)): each rank computed a column-slice of
+        #     the output, so output placement is Shard(-1).
+        #   - RowwiseParallel (weight Shard(1)): each rank computed a partial sum over
+        #     the input features, so output placement is Partial() (needs all-reduce).
+        if weight_is_dtensor:
+            weight_placements = ctx.weight_placements
+            if any(isinstance(p, Shard) and p.dim == 0 for p in weight_placements):
+                out_placements = (Shard(-1),)
+            else:
+                out_placements = (Partial(),)
+            out = DTensor.from_local(
+                out, ctx.weight_device_mesh, out_placements, run_check=False
+            )
+
         return out
 
     @staticmethod
@@ -63,6 +106,14 @@ class fp8_blockwise_mm(torch.autograd.Function):
         block_size = ctx.block_size
         out_dtype = ctx.out_dtype
         use_triton = ctx.use_triton
+        x_is_dtensor = ctx.x_is_dtensor
+        weight_is_dtensor = ctx.weight_is_dtensor
+
+        # Extract local tensor from DTensor grad_output.
+        # For ColwiseParallel the autograd engine provides DTensor(Shard(-1)).
+        # For RowwiseParallel it provides DTensor(Replicate) (gradient after allreduce).
+        if isinstance(grad_output, DTensor):
+            grad_output = grad_output.to_local()
 
         # Reshape input to 2D
         x_orig_shape = x.shape
@@ -126,6 +177,36 @@ class fp8_blockwise_mm(torch.autograd.Function):
 
         # Reshape grad_x to expected potentially 3D+ shape
         grad_x = grad_x.reshape(*grad_output_orig_shape[:-1], grad_x.shape[-1])
+
+        # Reconstruct DTensor gradients to match the DTensor inputs from forward.
+        if weight_is_dtensor:
+            weight_placements = ctx.weight_placements
+            weight_device_mesh = ctx.weight_device_mesh
+
+            # ColwiseParallel (weight Shard(0)): each rank computed a partial grad_x
+            # (over the column-slice of weight it owns), so we all-reduce to get the
+            # full gradient before wrapping as DTensor(same placement as x).
+            if any(isinstance(p, Shard) and p.dim == 0 for p in weight_placements):
+                torch.distributed.all_reduce(
+                    grad_x,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=weight_device_mesh.get_group(0),
+                )
+
+            # grad_weight is the gradient for the local weight shard, so it shares
+            # the same placement as the weight DTensor.
+            grad_weight = DTensor.from_local(
+                grad_weight, weight_device_mesh, weight_placements, run_check=False
+            )
+
+        if x_is_dtensor:
+            # Wrap grad_x as a DTensor with the same placement as the input x.
+            # For ColwiseParallel: x was Replicate, grad_x is now full (after all-reduce).
+            # For RowwiseParallel: x was Shard(-1), grad_x is the gradient for x's shard.
+            grad_x = DTensor.from_local(
+                grad_x, ctx.x_device_mesh, ctx.x_placements, run_check=False
+            )
+
         return grad_x, grad_weight, None, None, None
 
 
@@ -203,3 +284,116 @@ class Float8BlockwiseLinearConfig(AOBaseConfig):
 @register_quantize_module_handler(Float8BlockwiseLinearConfig)
 def _float8_blockwise_transform(module, config):
     return Float8BlockwiseLinear.from_float(module)
+
+
+class Float8BlockwiseColwiseParallel(ColwiseParallel):
+    """
+    Tensor parallel ColwiseParallel for Float8BlockwiseLinear.
+
+    Unlike Float8ColwiseParallel, this doesn't handle FP8 casting in the
+    input/output preparation functions since Float8BlockwiseLinear performs
+    FP8 casting internally within fp8_blockwise_mm.
+
+    The weight is sharded on dim 0 (output features). Each rank receives the
+    full input (Replicate) and produces a column-slice of the output (Shard(-1)).
+    fp8_blockwise_mm detects the DTensor weight and wraps its output as
+    DTensor(Shard(-1)) so _prepare_output_fn can redistribute it.
+
+    Example usage::
+
+        model = Float8BlockwiseLinear(in_features, out_features, bias=False)
+        parallelize_module(model, device_mesh, Float8BlockwiseColwiseParallel())
+    """
+
+    @staticmethod
+    def _prepare_input_fn(
+        input_layouts, desired_input_layouts, mod, inputs, device_mesh
+    ):
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, DTensor):
+            input_tensor = DTensor.from_local(
+                input_tensor, device_mesh, input_layouts, run_check=False
+            )
+
+        if input_layouts != desired_input_layouts:
+            input_tensor = input_tensor.redistribute(
+                placements=desired_input_layouts
+            )
+        return input_tensor
+
+    @staticmethod
+    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
+        # outputs is a DTensor(Shard(-1)) set by fp8_blockwise_mm forward.
+        if outputs.placements != output_layouts:
+            outputs = outputs.redistribute(placements=output_layouts, async_op=True)
+        return outputs.to_local() if use_local_output else outputs
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        if not isinstance(module, Float8BlockwiseLinear):
+            raise ValueError(
+                f"Expecting module to be Float8BlockwiseLinear but found {type(module)}"
+            )
+        return super()._apply(module, device_mesh)
+
+
+class Float8BlockwiseRowwiseParallel(RowwiseParallel):
+    """
+    Tensor parallel RowwiseParallel for Float8BlockwiseLinear.
+
+    Unlike Float8RowwiseParallel, this doesn't handle FP8 casting in the
+    input/output preparation functions since Float8BlockwiseLinear performs
+    FP8 casting internally within fp8_blockwise_mm.
+
+    The weight is sharded on dim 1 (input features). Each rank receives a
+    column-slice of the input (Shard(-1)) and produces a partial output sum.
+    fp8_blockwise_mm detects the DTensor weight and wraps its output as
+    DTensor(Partial()), which _prepare_output_fn reduces to Replicate via
+    an all-reduce.
+
+    Example usage (standalone, replicated input)::
+
+        model = Float8BlockwiseLinear(in_features, out_features, bias=False)
+        parallelize_module(
+            model, device_mesh,
+            Float8BlockwiseRowwiseParallel(input_layouts=(Replicate(),))
+        )
+
+    Example usage (after a ColwiseParallel layer, sharded input)::
+
+        parallelize_module(
+            model, device_mesh,
+            {"fc1": Float8BlockwiseColwiseParallel(),
+             "fc2": Float8BlockwiseRowwiseParallel()}
+        )
+    """
+
+    @staticmethod
+    def _prepare_input_fn(
+        input_layouts, desired_input_layouts, mod, inputs, device_mesh
+    ):
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, DTensor):
+            input_tensor = DTensor.from_local(
+                input_tensor, device_mesh, input_layouts, run_check=False
+            )
+
+        if input_layouts != desired_input_layouts:
+            input_tensor = input_tensor.redistribute(
+                placements=desired_input_layouts
+            )
+        return input_tensor
+
+    @staticmethod
+    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
+        # outputs is a DTensor(Partial()) set by fp8_blockwise_mm forward.
+        # Redistributing Partial() -> Replicate() triggers the all-reduce.
+        if outputs.placements != output_layouts:
+            outputs = outputs.redistribute(placements=output_layouts, async_op=True)
+        return outputs.to_local() if use_local_output else outputs
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        if not isinstance(module, Float8BlockwiseLinear):
+            raise ValueError(
+                f"Expecting module to be Float8BlockwiseLinear but found {type(module)}"
+            )
+        return super()._apply(module, device_mesh)
